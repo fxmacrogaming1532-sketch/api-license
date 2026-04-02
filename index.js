@@ -26,11 +26,6 @@ if (!admin.apps.length) {
       projectId: FIREBASE_PROJECT_ID,
       clientEmail: FIREBASE_CLIENT_EMAIL,
       privateKey: FIREBASE_PRIVATE_KEY,
-
-      // compatibilidade extra
-      project_id: FIREBASE_PROJECT_ID,
-      client_email: FIREBASE_CLIENT_EMAIL,
-      private_key: FIREBASE_PRIVATE_KEY,
     }),
     databaseURL: "https://fx-store---banco-de-dados-default-rtdb.firebaseio.com",
   });
@@ -80,19 +75,23 @@ async function getPlanById(planId) {
 }
 
 async function findLicenseByInput(licenseInput) {
-  const docRef = db.collection("licenses").doc(String(licenseInput));
-  const docSnap = await docRef.get();
+  const directRef = db.collection("licenses").doc(String(licenseInput));
+  const directSnap = await directRef.get();
 
-  if (docSnap.exists) {
+  if (directSnap.exists) {
     return {
-      id: docSnap.id,
-      ref: docRef,
-      data: docSnap.data(),
+      id: directSnap.id,
+      ref: directRef,
+      data: directSnap.data(),
     };
   }
 
   const hash = sha256(String(licenseInput));
-  const querySnap = await db.collection("licenses").where("keyHash", "==", hash).limit(1).get();
+  const querySnap = await db
+    .collection("licenses")
+    .where("keyHash", "==", hash)
+    .limit(1)
+    .get();
 
   if (querySnap.empty) return null;
 
@@ -119,12 +118,13 @@ app.get("/", (req, res) => {
 ========================= */
 app.get("/admin/dashboard", async (req, res) => {
   try {
-    const [licensesSnap, clientsSnap, devicesSnap, latestActivationsSnap] = await Promise.all([
-      db.collection("licenses").get(),
-      db.collection("clients").get(),
-      db.collection("devices").get(),
-      db.collection("activations").orderBy("createdAt", "desc").limit(10).get(),
-    ]);
+    const [licensesSnap, clientsSnap, devicesSnap, latestActivationsSnap] =
+      await Promise.all([
+        db.collection("licenses").get(),
+        db.collection("clients").get(),
+        db.collection("devices").get(),
+        db.collection("activations").orderBy("createdAt", "desc").limit(10).get(),
+      ]);
 
     let activeLicenses = 0;
     let expiredLicenses = 0;
@@ -150,7 +150,10 @@ app.get("/admin/dashboard", async (req, res) => {
       const x = doc.data();
       const createdAt = toDateSafe(x.createdAt);
       if (!createdAt) return;
-      if (createdAt.getMonth() === currentMonth && createdAt.getFullYear() === currentYear) {
+      if (
+        createdAt.getMonth() === currentMonth &&
+        createdAt.getFullYear() === currentYear
+      ) {
         monthRevenue += Number(x.planPrice || x.price || 0);
       }
     });
@@ -266,15 +269,8 @@ app.get("/admin/licenses", async (req, res) => {
 
 app.post("/admin/licenses", async (req, res) => {
   try {
-    const {
-      plan,
-      quantity,
-      status,
-      prefix,
-      stockMessage,
-      discordLink,
-      stockMode,
-    } = req.body || {};
+    const { plan, quantity, status, prefix, stockMessage, discordLink, stockMode } =
+      req.body || {};
 
     if (!plan) {
       return res.status(400).json({
@@ -297,6 +293,7 @@ app.post("/admin/licenses", async (req, res) => {
     for (let i = 0; i < qty; i += 1) {
       const plainKey = generateLicenseKey(prefix || "FXS");
       const keyHash = sha256(plainKey);
+
       const expiresAtDate =
         Number(planData.durationHours || 0) > 0
           ? new Date(Date.now() + Number(planData.durationHours) * 60 * 60 * 1000)
@@ -324,7 +321,9 @@ app.post("/admin/licenses", async (req, res) => {
         lastValidationAt: null,
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        expiresAt: expiresAtDate ? admin.firestore.Timestamp.fromDate(expiresAtDate) : null,
+        expiresAt: expiresAtDate
+          ? admin.firestore.Timestamp.fromDate(expiresAtDate)
+          : null,
       });
 
       createdItems.push({
@@ -355,7 +354,10 @@ app.post("/admin/licenses/:id/status", async (req, res) => {
     const { status } = req.body || {};
 
     if (!status) {
-      return res.status(400).json({ ok: false, error: "missing_status" });
+      return res.status(400).json({
+        ok: false,
+        error: "missing_status",
+      });
     }
 
     await db.collection("licenses").doc(String(id)).update({
@@ -512,7 +514,10 @@ app.post("/admin/blacklist/:id/toggle", async (req, res) => {
     const snap = await ref.get();
 
     if (!snap.exists) {
-      return res.status(404).json({ ok: false, error: "blacklist_not_found" });
+      return res.status(404).json({
+        ok: false,
+        error: "blacklist_not_found",
+      });
     }
 
     await ref.update({
@@ -549,7 +554,12 @@ app.get("/admin/finance", async (req, res) => {
       const x = doc.data();
       const createdAt = toDateSafe(x.createdAt);
       if (!createdAt) return;
-      if (createdAt.getMonth() !== currentMonth || createdAt.getFullYear() !== currentYear) return;
+      if (
+        createdAt.getMonth() !== currentMonth ||
+        createdAt.getFullYear() !== currentYear
+      ) {
+        return;
+      }
 
       const price = Number(x.planPrice || x.price || 0);
       const plan = String(x.plan || "unknown");
@@ -585,4 +595,325 @@ app.get("/admin/finance", async (req, res) => {
     });
   } catch (error) {
     return res.status(500).json({
-      ok
+      ok: false,
+      error: "finance_error",
+      details: error.message,
+    });
+  }
+});
+
+/* =========================
+   VALIDATE
+========================= */
+app.post("/validate", async (req, res) => {
+  try {
+    const { licenseId, hwid, ip, username, email, city, country, appVersion } =
+      req.body || {};
+
+    if (!licenseId || !hwid) {
+      return res.status(400).json({
+        ok: false,
+        error: "missing_fields",
+      });
+    }
+
+    const licenseFound = await findLicenseByInput(String(licenseId));
+
+    if (!licenseFound) {
+      return res.status(404).json({
+        ok: false,
+        error: "license_not_found",
+      });
+    }
+
+    const { ref: licenseRef, id: realLicenseId, data: license } = licenseFound;
+
+    if (license.status !== "active") {
+      return res.status(403).json({
+        ok: false,
+        error: "license_inactive",
+      });
+    }
+
+    if (isExpired(license.expiresAt)) {
+      await licenseRef.update({
+        status: "expired",
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+
+      return res.status(403).json({
+        ok: false,
+        error: "license_expired",
+      });
+    }
+
+    const blockedHwid = await db
+      .collection("blacklist")
+      .where("type", "==", "hwid")
+      .where("value", "==", String(hwid))
+      .where("active", "==", true)
+      .limit(1)
+      .get();
+
+    if (!blockedHwid.empty) {
+      return res.status(403).json({
+        ok: false,
+        error: "hwid_blacklisted",
+      });
+    }
+
+    if (ip) {
+      const blockedIp = await db
+        .collection("blacklist")
+        .where("type", "==", "ip")
+        .where("value", "==", String(ip))
+        .where("active", "==", true)
+        .limit(1)
+        .get();
+
+      if (!blockedIp.empty) {
+        return res.status(403).json({
+          ok: false,
+          error: "ip_blacklisted",
+        });
+      }
+    }
+
+    const boundHwid = String(license.boundHwid || "");
+    const secondBoundHwid = String(license.secondBoundHwid || "");
+    const boundIp = String(license.boundIp || "");
+    const allowSecondDeviceSameIp = Boolean(license.allowSecondDeviceSameIp);
+
+    if (!boundHwid) {
+      await licenseRef.update({
+        boundHwid: String(hwid),
+        boundIp: String(ip || ""),
+        stockMode: false,
+        lastValidationAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+    } else if (boundHwid === String(hwid) || secondBoundHwid === String(hwid)) {
+      await licenseRef.update({
+        lastValidationAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+    } else {
+      if (!allowSecondDeviceSameIp) {
+        return res.status(403).json({
+          ok: false,
+          error: "hwid_mismatch",
+        });
+      }
+
+      if (!ip || !boundIp || String(ip) !== String(boundIp)) {
+        return res.status(403).json({
+          ok: false,
+          error: "second_device_requires_same_ip",
+        });
+      }
+
+      if (secondBoundHwid && secondBoundHwid !== String(hwid)) {
+        return res.status(403).json({
+          ok: false,
+          error: "device_limit_reached",
+        });
+      }
+
+      await licenseRef.update({
+        secondBoundHwid: String(hwid),
+        lastValidationAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+    }
+
+    const clientId = String(license.clientId || username || hwid);
+
+    const onlineState = await getOnlineState(clientId);
+    if (
+      onlineState &&
+      onlineState.state === "online" &&
+      onlineState.hwid &&
+      onlineState.hwid !== String(hwid)
+    ) {
+      return res.status(403).json({
+        ok: false,
+        error: "session_already_active",
+      });
+    }
+
+    const planId = String(license.plan || "");
+    const planPrice = Number(license.price || 0);
+
+    await db.collection("clients").doc(clientId).set(
+      {
+        username: String(username || clientId),
+        email: String(email || ""),
+        city: String(city || ""),
+        country: String(country || ""),
+        status: "active",
+        licenseId: realLicenseId,
+        plan: planId,
+        planPrice,
+        hwid: String(hwid),
+        ip: String(ip || ""),
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+
+    await licenseRef.update({
+      clientId,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    await db.collection("devices").doc(String(hwid)).set(
+      {
+        hwid: String(hwid),
+        clientId,
+        licenseId: realLicenseId,
+        ip: String(ip || ""),
+        sameIpGroup: String(ip || ""),
+        country: String(country || ""),
+        city: String(city || ""),
+        status: "active",
+        sessionState: "online",
+        appVersion: String(appVersion || ""),
+        lastSeenAt: admin.firestore.FieldValue.serverTimestamp(),
+        firstSeenAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+
+    await db.collection("activations").add({
+      action: "validate",
+      clientId,
+      licenseId: realLicenseId,
+      plan: planId,
+      planPrice,
+      hwid: String(hwid),
+      ip: String(ip || ""),
+      username: String(username || ""),
+      result: "success",
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    await rtdb.ref(`status/${clientId}`).set({
+      state: "online",
+      licenseId: realLicenseId,
+      hwid: String(hwid),
+      ip: String(ip || ""),
+      username: String(username || ""),
+      plan: planId,
+      last_changed: nowMs(),
+    });
+
+    return res.json({
+      ok: true,
+      message: "license_valid",
+      clientId,
+      licenseDocId: realLicenseId,
+    });
+  } catch (error) {
+    return res.status(500).json({
+      ok: false,
+      error: "internal_error",
+      details: error.message,
+    });
+  }
+});
+
+/* =========================
+   HEARTBEAT
+========================= */
+app.post("/heartbeat", async (req, res) => {
+  try {
+    const { clientId, licenseId, hwid, ip, appVersion } = req.body || {};
+
+    if (!clientId) {
+      return res.status(400).json({
+        ok: false,
+        error: "missing_clientId",
+      });
+    }
+
+    await rtdb.ref(`status/${clientId}`).update({
+      state: "online",
+      licenseId: String(licenseId || ""),
+      hwid: String(hwid || ""),
+      ip: String(ip || ""),
+      appVersion: String(appVersion || ""),
+      last_changed: nowMs(),
+    });
+
+    if (hwid) {
+      await db.collection("devices").doc(String(hwid)).set(
+        {
+          sessionState: "online",
+          lastSeenAt: admin.firestore.FieldValue.serverTimestamp(),
+          ip: String(ip || ""),
+          appVersion: String(appVersion || ""),
+        },
+        { merge: true }
+      );
+    }
+
+    return res.json({
+      ok: true,
+      message: "heartbeat_updated",
+    });
+  } catch (error) {
+    return res.status(500).json({
+      ok: false,
+      error: "heartbeat_error",
+      details: error.message,
+    });
+  }
+});
+
+/* =========================
+   LOGOUT
+========================= */
+app.post("/logout", async (req, res) => {
+  try {
+    const { clientId, hwid } = req.body || {};
+
+    if (!clientId) {
+      return res.status(400).json({
+        ok: false,
+        error: "missing_clientId",
+      });
+    }
+
+    await rtdb.ref(`status/${clientId}`).set({
+      state: "offline",
+      last_changed: nowMs(),
+    });
+
+    if (hwid) {
+      await db.collection("devices").doc(String(hwid)).set(
+        {
+          sessionState: "offline",
+          lastSeenAt: admin.firestore.FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
+    }
+
+    return res.json({
+      ok: true,
+      message: "client_offline",
+    });
+  } catch (error) {
+    return res.status(500).json({
+      ok: false,
+      error: "logout_error",
+      details: error.message,
+    });
+  }
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Server rodando na porta ${PORT}`);
+});
