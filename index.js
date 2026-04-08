@@ -33,9 +33,79 @@ if (!admin.apps.length) {
 
 const db = admin.firestore();
 const rtdb = admin.database();
+const ONLINE_PRESENCE_PATH = "status";
+const ONLINE_PRESENCE_TTL_MS = Math.max(
+  5000,
+  Number(process.env.ONLINE_PRESENCE_TTL_MS || 35000)
+);
+const ONLINE_PRESENCE_CLEANUP_INTERVAL_MS = 15000;
+let _nextOnlinePresenceCleanupAtMs = 0;
 
 function nowMs() {
   return Date.now();
+}
+
+function safeString(value) {
+  return String(value || "").trim();
+}
+
+function parseOnlinePresenceTs(value) {
+  const n = Number(value || 0);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function isOnlinePresenceActive(entry, now = nowMs()) {
+  if (!entry || typeof entry !== "object") return false;
+  const state = safeString(entry.state).toLowerCase();
+  const lastChanged = parseOnlinePresenceTs(entry.last_changed);
+  if (state !== "online" || lastChanged <= 0) return false;
+  return now - lastChanged <= ONLINE_PRESENCE_TTL_MS;
+}
+
+async function getOnlinePresenceStats({ cleanupExpired = false, now = nowMs() } = {}) {
+  const ref = rtdb.ref(ONLINE_PRESENCE_PATH);
+  const snap = await ref.get();
+  if (!snap.exists()) {
+    return { onlineDevices: 0, removedExpired: 0, totalEntries: 0 };
+  }
+
+  const data = snap.val() || {};
+  const updates = {};
+  let onlineDevices = 0;
+  let removedExpired = 0;
+  let totalEntries = 0;
+
+  Object.keys(data).forEach((clientId) => {
+    totalEntries += 1;
+    const entry = data[clientId];
+    const active = isOnlinePresenceActive(entry, now);
+
+    if (active) {
+      onlineDevices += 1;
+      return;
+    }
+
+    if (cleanupExpired) {
+      updates[clientId] = null;
+      removedExpired += 1;
+    }
+  });
+
+  if (cleanupExpired && removedExpired > 0) {
+    await ref.update(updates);
+  }
+
+  return { onlineDevices, removedExpired, totalEntries };
+}
+
+async function cleanupOnlinePresenceIfNeeded(now = nowMs()) {
+  if (now < _nextOnlinePresenceCleanupAtMs) {
+    return { removedExpired: 0, onlineDevices: -1, skipped: true };
+  }
+
+  const stats = await getOnlinePresenceStats({ cleanupExpired: true, now });
+  _nextOnlinePresenceCleanupAtMs = now + ONLINE_PRESENCE_CLEANUP_INTERVAL_MS;
+  return { ...stats, skipped: false };
 }
 
 function toDateSafe(value) {
@@ -118,57 +188,51 @@ app.get("/", (req, res) => {
 ========================= */
 app.get("/admin/dashboard", async (req, res) => {
   try {
-    const [licensesSnap, clientsSnap, devicesSnap, latestActivationsSnap] =
-      await Promise.all([
-        db.collection("licenses").get(),
-        db.collection("clients").get(),
-        db.collection("devices").get(),
+    const now = nowMs();
+    const presenceStats = await getOnlinePresenceStats({ cleanupExpired: true, now });
+    const onlineDevices = Number(presenceStats.onlineDevices || 0);
+
+    let totalLicenses = 0;
+    let activeLicenses = 0;
+    let expiredLicenses = 0;
+    let totalClients = 0;
+    let monthRevenue = 0;
+    let latestActivations = [];
+
+    try {
+      const [statsSnap, latestActivationsSnap] = await Promise.all([
+        db.collection("stats").doc("global").get(),
         db.collection("activations").orderBy("createdAt", "desc").limit(10).get(),
       ]);
 
-    let activeLicenses = 0;
-    let expiredLicenses = 0;
-    let onlineDevices = 0;
-    let monthRevenue = 0;
+      const stats = statsSnap.exists ? statsSnap.data() : {};
+      totalLicenses = Number(stats.totalLicenses || 0);
+      activeLicenses = Number(stats.activeLicenses || 0);
+      expiredLicenses = Number(stats.expiredLicenses || 0);
+      totalClients = Number(stats.totalClients || 0);
+      monthRevenue = Number(stats.monthlyRevenue || stats.monthRevenue || 0);
 
-    const now = new Date();
-    const currentMonth = now.getMonth();
-    const currentYear = now.getFullYear();
+      latestActivations = latestActivationsSnap.docs.map((doc) => ({
+        id: doc.id,
+        ...doc.data(),
+      }));
+    } catch (metricsError) {
+      console.warn("[dashboard] metrics_unavailable", metricsError.message);
+    }
 
-    licensesSnap.forEach((doc) => {
-      const x = doc.data();
-      if (x.status === "active") activeLicenses += 1;
-      if (x.status === "expired" || isExpired(x.expiresAt)) expiredLicenses += 1;
-    });
-
-    devicesSnap.forEach((doc) => {
-      const x = doc.data();
-      if (x.sessionState === "online" || x.status === "active") onlineDevices += 1;
-    });
-
-    clientsSnap.forEach((doc) => {
-      const x = doc.data();
-      const createdAt = toDateSafe(x.createdAt);
-      if (!createdAt) return;
-      if (
-        createdAt.getMonth() === currentMonth &&
-        createdAt.getFullYear() === currentYear
-      ) {
-        monthRevenue += Number(x.planPrice || x.price || 0);
-      }
-    });
-
-    const latestActivations = latestActivationsSnap.docs.map((doc) => ({
-      id: doc.id,
-      ...doc.data(),
-    }));
+    console.log(
+      "[presence] dashboard onlineDevices=" +
+        onlineDevices +
+        " removedExpired=" +
+        Number(presenceStats.removedExpired || 0)
+    );
 
     return res.json({
       ok: true,
-      totalLicenses: licensesSnap.size,
+      totalLicenses,
       activeLicenses,
       expiredLicenses,
-      totalClients: clientsSnap.size,
+      totalClients,
       onlineDevices,
       monthRevenue,
       latestActivations,
@@ -828,39 +892,72 @@ app.post("/validate", async (req, res) => {
 ========================= */
 app.post("/heartbeat", async (req, res) => {
   try {
-    const { clientId, licenseId, hwid, ip, appVersion } = req.body || {};
+    const { clientId, licenseId, hwid, ip, appVersion, sessionId } = req.body || {};
+    const normalizedClientId = safeString(clientId);
+    const normalizedLicenseId = safeString(licenseId);
+    const normalizedHwid = safeString(hwid);
+    const normalizedIp = safeString(ip);
+    const normalizedAppVersion = safeString(appVersion);
+    const normalizedSessionId = safeString(sessionId);
+    const now = nowMs();
 
-    if (!clientId) {
+    if (!normalizedClientId) {
       return res.status(400).json({
         ok: false,
         error: "missing_clientId",
       });
     }
 
-    await rtdb.ref(`status/${clientId}`).update({
+    console.log(
+      "[presence] heartbeat clientId=" +
+        normalizedClientId +
+        " licenseId=" +
+        (normalizedLicenseId || "-") +
+        " hwid=" +
+        (normalizedHwid || "-")
+    );
+
+    await rtdb.ref(`status/${normalizedClientId}`).update({
       state: "online",
-      licenseId: String(licenseId || ""),
-      hwid: String(hwid || ""),
-      ip: String(ip || ""),
-      appVersion: String(appVersion || ""),
-      last_changed: nowMs(),
+      clientId: normalizedClientId,
+      licenseId: normalizedLicenseId,
+      hwid: normalizedHwid,
+      ip: normalizedIp,
+      appVersion: normalizedAppVersion,
+      sessionId: normalizedSessionId,
+      last_changed: now,
     });
 
-    if (hwid) {
-      await db.collection("devices").doc(String(hwid)).set(
-        {
-          sessionState: "online",
-          lastSeenAt: admin.firestore.FieldValue.serverTimestamp(),
-          ip: String(ip || ""),
-          appVersion: String(appVersion || ""),
-        },
-        { merge: true }
-      );
+    if (normalizedHwid) {
+      try {
+        await db.collection("devices").doc(normalizedHwid).set(
+          {
+            sessionState: "online",
+            clientId: normalizedClientId,
+            licenseId: normalizedLicenseId,
+            lastSeenAt: admin.firestore.FieldValue.serverTimestamp(),
+            ip: normalizedIp,
+            appVersion: normalizedAppVersion,
+          },
+          { merge: true }
+        );
+      } catch (deviceError) {
+        console.warn("[presence] heartbeat devices_update_failed", deviceError.message);
+      }
     }
+
+    await cleanupOnlinePresenceIfNeeded(now);
+    const presenceStats = await getOnlinePresenceStats({ cleanupExpired: false, now });
+
+    console.log(
+      "[presence] active_after_heartbeat onlineDevices=" +
+        Number(presenceStats.onlineDevices || 0)
+    );
 
     return res.json({
       ok: true,
       message: "heartbeat_updated",
+      onlineDevices: Number(presenceStats.onlineDevices || 0),
     });
   } catch (error) {
     return res.status(500).json({
@@ -877,27 +974,36 @@ app.post("/heartbeat", async (req, res) => {
 app.post("/logout", async (req, res) => {
   try {
     const { clientId, hwid } = req.body || {};
+    const normalizedClientId = safeString(clientId);
+    const normalizedHwid = safeString(hwid);
 
-    if (!clientId) {
+    if (!normalizedClientId) {
       return res.status(400).json({
         ok: false,
         error: "missing_clientId",
       });
     }
 
-    await rtdb.ref(`status/${clientId}`).set({
-      state: "offline",
-      last_changed: nowMs(),
-    });
+    await rtdb.ref(`status/${normalizedClientId}`).remove();
+    console.log(
+      "[presence] logout clientId=" +
+        normalizedClientId +
+        " hwid=" +
+        (normalizedHwid || "-")
+    );
 
-    if (hwid) {
-      await db.collection("devices").doc(String(hwid)).set(
-        {
-          sessionState: "offline",
-          lastSeenAt: admin.firestore.FieldValue.serverTimestamp(),
-        },
-        { merge: true }
-      );
+    if (normalizedHwid) {
+      try {
+        await db.collection("devices").doc(normalizedHwid).set(
+          {
+            sessionState: "offline",
+            lastSeenAt: admin.firestore.FieldValue.serverTimestamp(),
+          },
+          { merge: true }
+        );
+      } catch (deviceError) {
+        console.warn("[presence] logout devices_update_failed", deviceError.message);
+      }
     }
 
     return res.json({
